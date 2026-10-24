@@ -260,7 +260,7 @@ pub const ConfigOptions = struct {
 
     /// Comma-separated list of key=value pairs to include in the request as headers.
     /// Format "key1=value1,key2=value2,...".
-    /// They wll be parsed into HTTP headers and all the values will be treated as strings.
+    /// They wll be parsed into HTTP headers, or gRPC metadata, and all the values will be treated as strings.
     headers: ?[]const u8 = null,
 
     tls_opts: ?TLSOptions = null,
@@ -279,6 +279,10 @@ pub const ConfigOptions = struct {
 
     // Tracks whether `endpoint` was allocated by us and must be freed on deinit.
     endpoint_owned: bool = false,
+
+    // The transport security that the scheme of `endpoint` selects, if it had one.
+    // Kept apart from `insecure`, which also applies to signal endpoints without a scheme.
+    endpoint_insecure: ?bool = null,
 
     const max_timeout_sec = 600;
 
@@ -347,21 +351,32 @@ pub const ConfigOptions = struct {
         // TODO implement the rest of the environment variables.
     }
 
+    const Scheme = @FieldType(ConfigOptions, "scheme");
+
+    // Splits the scheme, if any, from a bare host:port or a full URL.
+    fn splitScheme(raw: []const u8) !struct { scheme: ?Scheme, rest: []const u8 } {
+        if (std.mem.indexOf(u8, raw, "://") == null) return .{ .scheme = null, .rest = raw };
+        const uri = Uri.parse(raw) catch return ConfigError.InvalidEndpoint;
+        var buf: ["https".len]u8 = undefined;
+        if (uri.scheme.len > buf.len) return ConfigError.InvalidScheme;
+        const lower = std.ascii.lowerString(buf[0..uri.scheme.len], uri.scheme);
+        return .{
+            .scheme = std.meta.stringToEnum(Scheme, lower) orelse return ConfigError.InvalidScheme,
+            .rest = raw[uri.scheme.len + "://".len ..],
+        };
+    }
+
     // Accepts bare host:port or a full URL; splits any scheme into self.scheme.
     fn setEndpointFromUrl(self: *ConfigOptions, raw: []const u8) !void {
-        var value = raw;
-        if (std.mem.indexOf(u8, raw, "://") != null) {
-            const uri = Uri.parse(raw) catch return ConfigError.InvalidEndpoint;
-            var buf: ["https".len]u8 = undefined;
-            if (uri.scheme.len > buf.len) return ConfigError.InvalidScheme;
-            const lower = std.ascii.lowerString(buf[0..uri.scheme.len], uri.scheme);
-            const Scheme = @FieldType(ConfigOptions, "scheme");
-            self.scheme = std.meta.stringToEnum(Scheme, lower) orelse return ConfigError.InvalidScheme;
-            value = raw[uri.scheme.len + "://".len ..];
+        const split = try splitScheme(raw);
+        if (split.scheme) |scheme| {
+            self.scheme = scheme;
+            // gRPC dials a bare host:port, so for it the scheme is the TLS
+            // switch — and per spec it wins: the insecure setting applies only
+            // to endpoints given without a scheme.
+            self.endpoint_insecure = scheme != .https;
         }
-        while (value.len > 0 and value[value.len - 1] == '/') {
-            value = value[0 .. value.len - 1];
-        }
+        const value = std.mem.trimEnd(u8, split.rest, "/");
         if (value.len == 0) return ConfigError.InvalidEndpoint;
         const owned = try self.allocator.dupe(u8, value);
         if (self.endpoint_owned) self.allocator.free(self.endpoint);
@@ -397,6 +412,27 @@ pub const ConfigOptions = struct {
 
         return url.toOwnedSlice(allocator);
     }
+
+    const GrpcEndpoint = struct {
+        endpoint: []const u8,
+        insecure: ?bool,
+    };
+
+    // Where to send each signal over gRPC: a custom signal URL replaces the
+    // endpoint, and is used as is, without appending a path as for HTTP.
+    // As for the endpoint, its scheme, if any, decides the transport security.
+    // Returned memory is borrowed from self.
+    fn grpcEndpointForSignal(self: ConfigOptions, signal: Signal) !GrpcEndpoint {
+        const url = self.custom_signal_urls.get(signal) orelse
+            return .{ .endpoint = self.endpoint, .insecure = self.endpoint_insecure orelse self.insecure };
+        const split = try splitScheme(url);
+        const endpoint = std.mem.trimEnd(u8, split.rest, "/");
+        if (endpoint.len == 0) return ConfigError.InvalidEndpoint;
+        return .{
+            .endpoint = endpoint,
+            .insecure = if (split.scheme) |scheme| scheme != .https else self.insecure,
+        };
+    }
 };
 
 test "otlp config from env" {
@@ -415,6 +451,8 @@ test "otlp config from env" {
     try std.testing.expectEqualStrings(new_endpoint, config.endpoint);
     try std.testing.expectEqual(Compression.gzip, config.compression);
     try std.testing.expectEqual(Protocol.grpc, config.protocol);
+    // No scheme in the endpoint: the transport security choice stays unset.
+    try std.testing.expectEqual(@as(?bool, null), config.insecure);
 }
 
 test "otlp config from env with URL scheme in endpoint" {
@@ -424,6 +462,7 @@ test "otlp config from env with URL scheme in endpoint" {
         env: []const u8,
         endpoint: []const u8,
         scheme: @FieldType(ConfigOptions, "scheme"),
+        insecure: ?bool,
         url: []const u8,
         signal: Signal,
     };
@@ -432,6 +471,7 @@ test "otlp config from env with URL scheme in endpoint" {
             .env = "http://localhost:4318",
             .endpoint = "localhost:4318",
             .scheme = .http,
+            .insecure = true,
             .signal = .traces,
             .url = "http://localhost:4318/v1/traces",
         },
@@ -439,6 +479,7 @@ test "otlp config from env with URL scheme in endpoint" {
             .env = "https://collector.example.com:4318/",
             .endpoint = "collector.example.com:4318",
             .scheme = .https,
+            .insecure = false,
             .signal = .metrics,
             .url = "https://collector.example.com:4318/v1/metrics",
         },
@@ -447,6 +488,7 @@ test "otlp config from env with URL scheme in endpoint" {
             .env = "HTTPS://collector:4318",
             .endpoint = "collector:4318",
             .scheme = .https,
+            .insecure = false,
             .signal = .logs,
             .url = "https://collector:4318/v1/logs",
         },
@@ -455,6 +497,7 @@ test "otlp config from env with URL scheme in endpoint" {
             .env = "http://host:4318/mycollector/",
             .endpoint = "host:4318/mycollector",
             .scheme = .http,
+            .insecure = true,
             .signal = .traces,
             .url = "http://host:4318/mycollector/v1/traces",
         },
@@ -463,6 +506,7 @@ test "otlp config from env with URL scheme in endpoint" {
             .env = "http://host:4318///",
             .endpoint = "host:4318",
             .scheme = .http,
+            .insecure = true,
             .signal = .traces,
             .url = "http://host:4318/v1/traces",
         },
@@ -478,6 +522,9 @@ test "otlp config from env with URL scheme in endpoint" {
 
         try std.testing.expectEqualStrings(c.endpoint, config.endpoint);
         try std.testing.expect(config.scheme == c.scheme);
+        try std.testing.expectEqual(c.insecure, (try config.grpcEndpointForSignal(c.signal)).insecure);
+        // Left for the signal endpoints without a scheme
+        try std.testing.expectEqual(@as(?bool, null), config.insecure);
 
         const url = try config.httpUrlForSignal(c.signal, allocator);
         defer allocator.free(url);
@@ -526,6 +573,43 @@ test "otlp config custom endpoint for singals" {
     try std.testing.expectEqualStrings("https://another.com:1234/traces", customTraces);
     try std.testing.expectEqualStrings("http://metrics-new:1234", customMetrics);
     try std.testing.expectEqualStrings("http://localhost:4318/v1/logs", standardLogs);
+}
+
+test "otlp config custom endpoint for signals over gRPC" {
+    const allocator = std.testing.allocator;
+
+    var map = EnvMap.init(allocator);
+    defer map.deinit();
+    try map.put("OTEL_EXPORTER_OTLP_ENDPOINT", "http://collector:4317");
+    try map.put("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", "https://traces.example.com:4317/");
+    try map.put("OTEL_EXPORTER_OTLP_METRICS_ENDPOINT", "metrics:4317");
+    // logs are left untouched
+
+    var config = try ConfigOptions.init(allocator, &map);
+    defer config.deinit();
+
+    // The scheme decides the transport security, and no path is appended.
+    const traces = try config.grpcEndpointForSignal(.traces);
+    try std.testing.expectEqualStrings("traces.example.com:4317", traces.endpoint);
+    try std.testing.expectEqual(@as(?bool, false), traces.insecure);
+    // Without a scheme, the insecure setting applies, not the scheme of the endpoint it replaces.
+    const metrics = try config.grpcEndpointForSignal(.metrics);
+    try std.testing.expectEqualStrings("metrics:4317", metrics.endpoint);
+    try std.testing.expectEqual(@as(?bool, null), metrics.insecure);
+    const logs = try config.grpcEndpointForSignal(.logs);
+    try std.testing.expectEqualStrings("collector:4317", logs.endpoint);
+    try std.testing.expectEqual(@as(?bool, true), logs.insecure);
+
+    // Still unset with TLS files configured, so that they select SSL credentials.
+    config.tls_opts = .{ .certificate_file = "/some/ca.pem" };
+    try std.testing.expectEqual(@as(?bool, null), (try config.grpcEndpointForSignal(.metrics)).insecure);
+    config.insecure = false;
+    try std.testing.expectEqual(@as(?bool, false), (try config.grpcEndpointForSignal(.metrics)).insecure);
+    // While the scheme of an endpoint still wins over it.
+    try std.testing.expectEqual(@as(?bool, true), (try config.grpcEndpointForSignal(.logs)).insecure);
+
+    try config.custom_signal_urls.put(allocator, .logs, try allocator.dupe(u8, "ftp://logs:4317"));
+    try std.testing.expectError(ConfigError.InvalidScheme, config.grpcEndpointForSignal(.logs));
 }
 
 test "otlp config validation" {
@@ -957,14 +1041,21 @@ pub fn Export(
 
             break :blk http_client.send(url, payload);
         },
-        .grpc => grpc_transport.send(allocator, otlp_payload.signal().grpcPath(), payload, .{
-            .endpoint = config.endpoint,
-            .insecure = config.insecure,
-            .timeout_sec = config.timeout_sec,
-            .server_root_certificates_filename = if (config.tls_opts) |tls| tls.certificate_file else null,
-            .client_certificate_filename = if (config.tls_opts) |tls| tls.client_certificate_file else null,
-            .client_private_key_filename = if (config.tls_opts) |tls| tls.client_private_key_file else null,
-        }),
+        .grpc => blk: {
+            const target = try config.grpcEndpointForSignal(otlp_payload.signal());
+            const headers: []const std.http.Header = if (config.headers) |h| try parseHeaders(allocator, h) else &.{};
+            defer allocator.free(headers);
+
+            break :blk grpc_transport.send(allocator, io, otlp_payload.signal().grpcPath(), payload, .{
+                .endpoint = target.endpoint,
+                .insecure = target.insecure,
+                .timeout_sec = config.timeout_sec,
+                .headers = headers,
+                .server_root_certificates_filename = if (config.tls_opts) |tls| tls.certificate_file else null,
+                .client_certificate_filename = if (config.tls_opts) |tls| tls.client_certificate_file else null,
+                .client_private_key_filename = if (config.tls_opts) |tls| tls.client_private_key_file else null,
+            });
+        },
     } catch |err| {
         // Both retry-related variants are signaling state, not failure: the
         // HTTP transport owns its retry loop ("Enqueued"), while the gRPC

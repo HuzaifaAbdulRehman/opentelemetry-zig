@@ -8,7 +8,7 @@ const CompilationInfo = helpers.CompilationInfo;
 // Path of the OpenTelemetry SDK source root directory relative to the build.zig file.
 const sdk_root = "opentelemetry-sdk";
 
-const GrpcProvider = enum { none };
+const GrpcProvider = enum { none, libgrpc };
 
 // Sets up the dependencies, modules and static library for the OpenTelemetry
 // SDK, and installs its artifacts and headers.
@@ -17,7 +17,7 @@ pub fn Setup(
     info: CompilationInfo,
     dependencies: *BuildModules,
 ) !void {
-    try modules(b, info, dependencies);
+    const grpc = try modules(b, info, dependencies);
 
     const sdk_lib = b.addLibrary(.{
         .name = "opentelemetry-sdk",
@@ -35,15 +35,16 @@ pub fn Setup(
     });
 
     _ = try addTestStep(b, dependencies, info);
-    try addExamplesStep(b, dependencies, sdk_lib, info);
+    try addExamplesStep(b, dependencies, sdk_lib, info, grpc);
     _ = try addBenchmarksStep(b, dependencies, info);
-    try addIntegrationStep(b, dependencies, info);
+    try addIntegrationStep(b, dependencies, info, grpc);
 
     const docs_step = try addDocsStep(b, dependencies, info);
     docs_step.dependOn(&sdk_lib.step);
 }
 
-fn modules(b: *std.Build, info: CompilationInfo, dependencies: *BuildModules) !void {
+// Returns the selected gRPC backend.
+fn modules(b: *std.Build, info: CompilationInfo, dependencies: *BuildModules) !GrpcProvider {
     const clock_mod = b.createModule(.{
         .root_source_file = b.path(sdk_root ++ "/src/clock.zig"),
         .target = info.target,
@@ -53,6 +54,7 @@ fn modules(b: *std.Build, info: CompilationInfo, dependencies: *BuildModules) !v
     try dependencies.put("clock", clock_mod);
 
     const grpc_provider = b.option(GrpcProvider, "grpc-provider", "Which gRPC implementation to use, if any") orelse .none;
+    const grpc_link_mode = b.option(std.builtin.LinkMode, "grpc-link-mode", "Link libgrpc statically or dynamically, with -Dgrpc-provider=libgrpc");
 
     // The selected gRPC backend is exposed to the SDK as the `grpc_transport`
     // module. Every backend's entry file lives under `opentelemetry-sdk/src/grpc/`
@@ -63,6 +65,33 @@ fn modules(b: *std.Build, info: CompilationInfo, dependencies: *BuildModules) !v
             .target = info.target,
             .optimize = info.optimize,
         }),
+        .libgrpc => blk: {
+            // A lazy dependency: if it is not fetched yet, this stops the
+            // configuration right away, and Zig fetches it and starts over.
+            // Returning early instead would leave the options and modules
+            // declared after this point missing from that first pass.
+            const cgrpc_dep = b.dependency("cgrpc_wrapper", .{
+                .target = info.target,
+                .optimize = info.optimize,
+                .link_mode = grpc_link_mode,
+            });
+
+            // Dependents look libgrpc up through this package to install it
+            // when dynamic, and `Dependency.artifact()` only finds installed
+            // artifacts: install it whatever the linking mode. With
+            // `-fsys=grpc` there is no artifact to install.
+            if (!b.systemIntegrationOption("grpc", .{}))
+                b.installArtifact(cgrpc_dep.artifact("grpc"));
+
+            break :blk b.createModule(.{
+                .root_source_file = b.path(sdk_root ++ "/src/grpc/libgrpc.zig"),
+                .target = info.target,
+                .optimize = info.optimize,
+                .imports = &.{
+                    .{ .name = "cgrpc_wrapper", .module = cgrpc_dep.module("cgrpc_wrapper") },
+                },
+            });
+        },
     };
     try dependencies.put("grpc_transport", grpc_transport_mod);
 
@@ -114,7 +143,7 @@ fn modules(b: *std.Build, info: CompilationInfo, dependencies: *BuildModules) !v
     });
     try dependencies.put("otlp-stub", otel_stub_mod);
 
-    return;
+    return grpc_provider;
 }
 
 // Registers the "sdk-test" step, building and running the SDK unit tests.
@@ -172,13 +201,18 @@ fn addExamplesStep(
     mods: *const BuildModules,
     sdk_lib_c: *std.Build.Step.Compile,
     info: CompilationInfo,
+    grpc: GrpcProvider,
 ) !void {
     const step = b.step("sdk-examples", "Build and install all SDK examples to zig-out/bin/<category>/");
     const run_step = b.step("sdk-run-examples", "Run installed SDK examples from zig-out");
     const examples_filter = b.option([]const u8, "examples-filter", "Filter examples to build");
 
-    const examples_dirs: []const []const u8 = &.{ "metrics", "trace", "logs", "baggage", "propagation" };
+    const examples_dirs: []const []const u8 = &.{ "metrics", "trace", "logs", "baggage", "propagation", "grpc" };
     for (examples_dirs) |example_dir| {
+        // The gRPC examples export over OTLP/gRPC on every run, which the noop
+        // backend can only fail: build them for a real backend only.
+        if (grpc == .none and std.mem.eql(u8, example_dir, "grpc")) continue;
+
         const example = buildExamples(
             b,
             b.path(b.pathJoin(&.{ sdk_root, "examples", example_dir })),
@@ -280,7 +314,12 @@ pub fn addBenchmarksStep(b: *std.Build, mods: *const BuildModules, info: Compila
 // Registers the "sdk-integration" step (build and install integration tests to
 // zig-out/bin/integration_tests/, without running them) and the
 // "sdk-run-integration" step (run the installed binaries; requires Docker).
-fn addIntegrationStep(b: *std.Build, mods: *const BuildModules, info: CompilationInfo) !void {
+fn addIntegrationStep(
+    b: *std.Build,
+    mods: *const BuildModules,
+    info: CompilationInfo,
+    grpc: GrpcProvider,
+) !void {
     const integration_filter = b.option(
         []const []const u8,
         "integration-filter",
@@ -295,6 +334,7 @@ fn addIntegrationStep(b: *std.Build, mods: *const BuildModules, info: Compilatio
         mods,
         info,
         integration_filter,
+        grpc,
     ) catch |err| {
         std.debug.print("Error building integration tests: {}\n", .{err});
         return err;
@@ -444,6 +484,7 @@ fn buildIntegrationTests(
     mods: *const BuildModules,
     info: CompilationInfo,
     integration_filter: ?[]const []const u8,
+    grpc_provider: GrpcProvider,
 ) ![]*std.Build.Step.Compile {
     const otel_mod = mods.get("opentelemetry-sdk") orelse return BuildError.ModuleNotFound;
     const clock_mod = mods.get("clock") orelse return BuildError.ModuleNotFound;
@@ -470,6 +511,13 @@ fn buildIntegrationTests(
         .optimize = info.optimize,
         .imports = try helpers.ImportsFromBuildModules(b.allocator, mods, &dep_names),
     });
+    {
+        // Tests covering a transport that may not be compiled in (currently
+        // only gRPC) read this to skip themselves instead of failing.
+        const integration_options = b.addOptions();
+        integration_options.addOption(GrpcProvider, "grpc_provider", grpc_provider);
+        common_mod.addOptions("integration_options", integration_options);
+    }
 
     var iter = test_dir.iterate();
     while (try iter.next(b.graph.io)) |file| {
