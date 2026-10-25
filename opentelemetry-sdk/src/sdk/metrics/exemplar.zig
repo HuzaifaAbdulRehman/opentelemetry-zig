@@ -270,8 +270,9 @@ pub const StreamIdentity = struct {
     record_min_max: bool = false,
 };
 
-/// Persistent reservoirs for the streams of one meter. The optional allocator
-/// fixes cache ownership independently of the allocator used by a collection.
+/// Reservoirs for recently sampled streams of one meter. Inactive streams are
+/// retired after collection; active streams reuse their reservoir. The optional
+/// allocator fixes cache ownership independently of the collection allocator.
 pub const Sampler = struct {
     allocator: ?std.mem.Allocator = null,
     reservoirs: std.HashMapUnmanaged(Key, ExemplarReservoir, KeyContext, std.hash_map.default_max_load_percentage) = .empty,
@@ -281,6 +282,7 @@ pub const Sampler = struct {
         options: ReservoirOptions,
         factory: ?ReservoirFactory,
         attributes: ?[]Attribute,
+        active: bool = true,
     };
     const KeyContext = struct {
         pub fn hash(_: KeyContext, key: Key) u64 {
@@ -322,6 +324,23 @@ pub const Sampler = struct {
         self.reservoirs = .empty;
     }
 
+    pub fn beginCollection(self: *Sampler) void {
+        var keys = self.reservoirs.keyIterator();
+        while (keys.next()) |key| key.active = false;
+    }
+
+    /// Keep reservoirs for active series, releasing historical label sets.
+    pub fn endCollection(self: *Sampler) void {
+        const allocator = self.allocator orelse return;
+        var entries = self.reservoirs.iterator();
+        while (entries.next()) |entry| {
+            if (entry.key_ptr.active) continue;
+            entry.value_ptr.deinit();
+            freeKey(allocator, entry.key_ptr.*);
+            self.reservoirs.removeByPtr(entry.key_ptr);
+        }
+    }
+
     fn freeKey(allocator: std.mem.Allocator, key: Key) void {
         if (key.attributes) |attrs| {
             for (attrs) |attr| freeAttribute(allocator, attr);
@@ -331,7 +350,10 @@ pub const Sampler = struct {
     }
 
     fn getOrCreate(self: *Sampler, allocator: std.mem.Allocator, io: std.Io, lookup: Key) !*ExemplarReservoir {
-        if (self.reservoirs.getPtr(lookup)) |existing| return existing;
+        if (self.reservoirs.getEntry(lookup)) |existing| {
+            existing.key_ptr.active = true;
+            return existing.value_ptr;
+        }
         var key = lookup;
         key.attributes = if (lookup.attributes) |attrs| try Exemplar.copyAttributes(allocator, attrs) else null;
         errdefer if (key.attributes) |attrs| {

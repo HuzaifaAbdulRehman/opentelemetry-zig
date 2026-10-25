@@ -801,6 +801,9 @@ pub const AggregatedMetrics = struct {
         meter.mx.lockUncancelable(meter.io);
         defer meter.mx.unlock(meter.io);
 
+        if (meter.exemplar_filter != .always_off) meter.exemplar_sampler.beginCollection();
+        defer if (meter.exemplar_filter != .always_off) meter.exemplar_sampler.endCollection();
+
         var results = std.ArrayList(Measurements).empty;
 
         errdefer {
@@ -1417,4 +1420,41 @@ test "exemplar custom reservoir changes with aggregation configuration" {
         }
         try std.testing.expectEqual(index + 1, Factory.calls);
     }
+}
+
+test "exemplar reservoirs retire inactive series between collections" {
+    const allocator = std.testing.allocator;
+    var meter = Meter{ .scope = .{ .name = "exemplar-retirement" }, .instruments = .empty, .allocator = allocator, .io = std.testing.io };
+    defer meter.deinit();
+    const Factory = struct {
+        var calls: usize = 0;
+        fn create(a: std.mem.Allocator, io: std.Io, options: exemplar.ReservoirOptions) !exemplar.ExemplarReservoir {
+            calls += 1;
+            return exemplar.AlignedHistogramBucketExemplarReservoir.init(a, io, options.aligned);
+        }
+    };
+    Factory.calls = 0;
+    const views = [_]view.View{.{
+        .instrument_selector = .{},
+        .aggregation = .{ .ExplicitBucketHistogram = .{} },
+        .temporality = .Delta,
+        .exemplar_reservoir = Factory.create,
+    }};
+    const histogram = try meter.createHistogram(u64, .{ .name = "requests" });
+    histogram.exemplar_filter = .always_on;
+    for (0..8) |index| {
+        for (0..2) |_| {
+            try histogram.record(1, .{ "series", @as(u64, index) });
+            const collected = try AggregatedMetrics.fetch(allocator, &meter, &views, null);
+            defer {
+                for (collected) |*measurement| measurement.deinit(allocator);
+                allocator.free(collected);
+            }
+            try std.testing.expectEqual(@as(usize, 1), meter.exemplar_sampler.reservoirs.count());
+        }
+        try std.testing.expectEqual(index + 1, Factory.calls);
+    }
+    const idle = try AggregatedMetrics.fetch(allocator, &meter, &views, null);
+    defer allocator.free(idle);
+    try std.testing.expectEqual(@as(usize, 0), meter.exemplar_sampler.reservoirs.count());
 }
