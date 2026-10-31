@@ -39,6 +39,7 @@ pub fn DataPoint(comptime T: type) type {
             var candidate = try Exemplar.capture(T, allocator, self.value, self.attributes, filter);
             errdefer if (candidate) |*sample| sample.deinit(allocator);
             if (candidate != null) try self.ownAttributes(allocator);
+            if (self.exemplar_candidate) |*previous| previous.deinit(allocator);
             self.exemplar_candidate = candidate;
         }
 
@@ -386,4 +387,17 @@ fn exemplarPointCopyFailure(allocator: std.mem.Allocator) !void {
     point.exemplar_candidate = (try exemplar.Exemplar.capture(i64, allocator, 7, &attrs, .always_on)).?;
     var copy = try point.deepCopy(allocator);
     defer copy.deinit(allocator);
+}
+
+test "exemplar capture replaces owned snapshots without leaks" {
+    inline for (.{ exemplar_sdk.ExemplarFilter.always_on, exemplar_sdk.ExemplarFilter.always_off }) |filter|
+        try std.testing.checkAllAllocationFailures(std.testing.allocator, recaptureExemplarFailure, .{filter});
+}
+
+fn recaptureExemplarFailure(allocator: std.mem.Allocator, filter: exemplar_sdk.ExemplarFilter) !void {
+    var point = try DataPoint(i64).new(allocator, 7, .{ "request", @as([]const u8, "first") });
+    defer point.deinit(allocator);
+    try point.captureExemplar(allocator, .always_on);
+    try point.captureExemplar(allocator, filter);
+    try std.testing.expectEqual(filter == .always_on, point.exemplar_candidate != null);
 }

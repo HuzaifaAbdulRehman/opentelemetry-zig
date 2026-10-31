@@ -360,8 +360,6 @@ fn processCumulativeDataPoints(
 
         dp.value = output_value;
         dp.timestamps = gop.value_ptr.timestamps;
-        includeExemplarBounds(dp);
-        gop.value_ptr.timestamps = dp.timestamps;
     }
 }
 
@@ -446,16 +444,6 @@ fn bucketAggregation(
     return .{ .offset = new_offset, .bucket_counts = new_bucket_counts };
 }
 
-// A recording can race the previous drain before its collection time is stamped.
-fn includeExemplarBounds(point: anytype) void {
-    if (point.exemplars.len == 0) return;
-    if (point.timestamps) |*timestamps| {
-        var start = timestamps.start_time_ns orelse timestamps.time_ns;
-        for (point.exemplars) |sample| start = @min(start, sample.time_ns);
-        timestamps.start_time_ns = start;
-    }
-}
-
 fn processDeltaDataPoints(
     comptime T: type,
     map: *std.HashMap(ScopedDataPoint, DataPoint(T), HashContext, std.hash_map.default_max_load_percentage),
@@ -491,7 +479,6 @@ fn processDeltaDataPoints(
             gop.value_ptr.* = .{ .value = dp.value };
         }
         dp.timestamps = .{ .start_time_ns = start_time, .time_ns = dp_time };
-        includeExemplarBounds(dp);
         // Update map with this latest datapoint
         gop.value_ptr.value = dp.value;
         gop.value_ptr.timestamps = dp.timestamps;
@@ -993,7 +980,7 @@ test "cumulative exponential histogram cleans up on allocation failure" {
     }
 }
 
-test "exemplar temporal bounds include recordings racing the previous drain" {
+test "exemplar temporal aggregation preserves established collection bounds" {
     const allocator = std.testing.allocator;
     inline for (.{ false, true }) |cumulative| {
         const temporal = try TemporalAggregator.init(allocator);
@@ -1009,7 +996,7 @@ test "exemplar temporal bounds include recordings racing the previous drain" {
         var samples = [_]@import("exemplar.zig").Exemplar{.{ .value = .{ .int = 1 }, .time_ns = 190 }};
         points[0] = .{ .value = 1, .timestamps = .{ .start_time_ns = 190, .time_ns = 300 }, .exemplars = &samples };
         if (cumulative) try processCumulativeDataPoints(i64, &temporal.ints, &measurement, &points, 1) else try processDeltaDataPoints(i64, &temporal.ints, &measurement, &points, 1);
-        try std.testing.expectEqual(@as(u64, 190), points[0].timestamps.?.start_time_ns.?);
+        try std.testing.expectEqual(@as(u64, 200), points[0].timestamps.?.start_time_ns.?);
         try std.testing.expectEqual(@as(u64, 300), points[0].timestamps.?.time_ns);
     }
 }

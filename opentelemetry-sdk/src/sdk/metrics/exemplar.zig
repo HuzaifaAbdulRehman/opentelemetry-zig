@@ -474,6 +474,8 @@ const AttributeSetContext = struct {
                 if (!std.mem.eql(u8, attr.key, other.key) or std.meta.activeTag(attr.value) != std.meta.activeTag(other.value)) continue;
                 const same_value = switch (attr.value) {
                     .string => |value| std.mem.eql(u8, value, other.value.string),
+                    .double => |value| value == other.value.double or
+                        @as(u64, @bitCast(value)) == @as(u64, @bitCast(other.value.double)),
                     else => std.meta.eql(attr.value, other.value),
                 };
                 if (same_value) {
@@ -700,4 +702,26 @@ test "exemplar collected payloads outlive a cache using another allocator" {
     live = false;
     try std.testing.expectEqual(tracked.allocated_bytes, tracked.freed_bytes);
     try std.testing.expectEqualStrings("abc", output[0].exemplars[0].filtered_attributes[0].value.string);
+}
+
+test "exemplar sampler retains NaN attribute series and signed zero identity" {
+    const allocator = std.testing.allocator;
+    const values = [_]f64{ @bitCast(@as(u64, 0x7ff8000000000001)), @bitCast(@as(u64, 0x7ff8000000000002)), std.math.inf(f64), -std.math.inf(f64), 0, -0.0 };
+    for (values) |value| {
+        var sampler: Sampler = .{};
+        defer sampler.deinit(allocator);
+        var raw_attrs = [_]Attribute{.{ .key = "value", .value = .{ .double = value } }};
+        var output_attrs = raw_attrs;
+        const raw = [_]SamplerTestPoint{.{ .attributes = &raw_attrs, .exemplar_candidate = .{ .value = .{ .int = 7 }, .time_ns = 100 } }};
+        var output = [_]SamplerTestPoint{.{ .attributes = &output_attrs }};
+        defer Exemplar.deinitList(allocator, output[0].exemplars);
+        try sampler.attach(allocator, std.testing.io, .{ .instrument_id = 1 }, .{ .fixed_size = 1 }, null, &raw, &output);
+        try std.testing.expectEqual(@as(usize, 1), output[0].exemplars.len);
+        try std.testing.expectEqual(@as(i64, 7), output[0].exemplars[0].value.int);
+    }
+    var positive = [_]Attribute{.{ .key = "zero", .value = .{ .double = 0 } }};
+    var negative = [_]Attribute{.{ .key = "zero", .value = .{ .double = -0.0 } }};
+    const ctx = AttributeSetContext{};
+    try std.testing.expect(ctx.eql(&positive, &negative));
+    try std.testing.expectEqual(ctx.hash(&positive), ctx.hash(&negative));
 }

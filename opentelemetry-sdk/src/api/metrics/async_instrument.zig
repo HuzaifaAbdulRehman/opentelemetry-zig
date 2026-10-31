@@ -1,4 +1,5 @@
 const std = @import("std");
+const clock = @import("clock");
 
 const Kind = @import("instrument.zig").Kind;
 const MeasurementsData = @import("measurement.zig").MeasurementsData;
@@ -182,6 +183,13 @@ pub fn ObservableInstrument(K: Kind) type {
                             data.* = .{ .int = &.{} };
                         }
                         try uniqueData.dedupByAttributes(allocator);
+                        // Observation and its collection cut share the same lock.
+                        const collection_time: u64 = @intCast(clock.nanoTimestamp());
+                        switch (uniqueData) {
+                            inline else => |points| for (points) |*point| {
+                                point.timestamps = .{ .time_ns = collection_time };
+                            },
+                        }
                         return uniqueData;
                     }
                     return null; // No callbacks registered, nothing to observe.
@@ -481,4 +489,21 @@ fn exemplarCallback(_: ObservedContext, allocator: std.mem.Allocator) MetricObse
     errdefer points[0].deinit(allocator);
     points[1] = try DataPoint(i64).new(allocator, 9, .{ "sensor", @as([]const u8, "two") });
     return .{ .int = points };
+}
+
+test "exemplar observable collection timestamps precede the next observation" {
+    inline for (.{ Kind.ObservableCounter, Kind.ObservableUpDownCounter, Kind.ObservableGauge }) |kind| {
+        var instrument = ObservableInstrument(kind).init(std.testing.allocator, std.testing.io, null);
+        defer instrument.deinit();
+        instrument.exemplar_filter = .always_on;
+        try instrument.registerCallback(exemplarCallback);
+        var first = try instrument.measurementsData(std.testing.allocator);
+        defer first.deinit(std.testing.allocator);
+        var second = try instrument.measurementsData(std.testing.allocator);
+        defer second.deinit(std.testing.allocator);
+        try std.testing.expect(first.int[0].timestamps != null);
+        const end = first.int[0].timestamps.?.time_ns;
+        for (first.int) |point| try std.testing.expectEqual(end, point.timestamps.?.time_ns);
+        for (second.int) |point| try std.testing.expect(end <= point.exemplar_candidate.?.time_ns);
+    }
 }

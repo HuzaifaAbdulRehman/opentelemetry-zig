@@ -1,5 +1,4 @@
 const std = @import("std");
-const clock = @import("clock");
 
 // NOTE: API-surface mutex operations use lockUncancelable so that user-facing
 // methods do not introduce cancellation points. This is safe with Io.Threaded
@@ -636,7 +635,9 @@ pub const AggregatedMetrics = struct {
             }
         }
 
-        const current_time: u64 = @intCast(clock.nanoTimestamp());
+        const current_time = switch (data_points) {
+            inline else => |points| (points[0].timestamps orelse return error.MissingCollectionTimestamp).time_ns,
+        };
 
         // Processing pipeline is split by aggregation type
         const aggregated: ?MeasurementsData = switch (aggregation_type.getType()) {
@@ -1457,4 +1458,55 @@ test "exemplar reservoirs retire inactive series between collections" {
     const idle = try AggregatedMetrics.fetch(allocator, &meter, &views, null);
     defer allocator.free(idle);
     try std.testing.expectEqual(@as(usize, 0), meter.exemplar_sampler.reservoirs.count());
+}
+
+test "exemplar collection time stays at the drain boundary during delayed aggregation" {
+    inline for (.{ .{ Kind.Counter, u64 }, .{ Kind.UpDownCounter, i64 }, .{ Kind.Histogram, u64 }, .{ Kind.Histogram, f64 }, .{ Kind.Gauge, i64 }, .{ Kind.Gauge, f64 } }) |case|
+        try checkExemplarDrainBoundary(case[0], case[1]);
+}
+
+fn checkExemplarDrainBoundary(comptime kind: Kind, comptime T: type) !void {
+    const allocator = std.testing.allocator;
+    var meter = Meter{ .scope = .{ .name = "exemplar-boundary" }, .instruments = .empty, .allocator = allocator, .io = std.testing.io };
+    defer meter.deinit();
+    const instrument = try Instrument.new(kind, .{ .name = "boundary" }, allocator);
+    defer instrument.deinit();
+    const typed = switch (kind) {
+        .Counter => try instrument.counter(std.testing.io, T),
+        .UpDownCounter => try instrument.upDownCounter(std.testing.io, T),
+        .Histogram => try instrument.histogram(std.testing.io, T),
+        .Gauge => try instrument.gauge(std.testing.io, T),
+        else => unreachable,
+    };
+    typed.exemplar_filter = .always_on;
+    if (kind == .Counter or kind == .UpDownCounter) try typed.add(1, .{}) else try typed.record(1, .{});
+    var first_raw = try instrument.getInstrumentsData(allocator);
+    var first_owned = true;
+    defer if (first_owned) first_raw.deinit(allocator);
+    if (kind == .Counter or kind == .UpDownCounter) try typed.add(2, .{}) else try typed.record(2, .{});
+    var second_raw = try instrument.getInstrumentsData(allocator);
+    var second_owned = true;
+    defer if (second_owned) second_raw.deinit(allocator);
+    const aggregation_type: view.Aggregation = switch (kind) {
+        .Gauge => .LastValue,
+        .Histogram => .{ .ExplicitBucketHistogram = .{} },
+        else => .Sum,
+    };
+    const ctx = AggregatedMetrics.ExemplarContext{ .meter = &meter, .instrument_id = @intFromPtr(instrument), .factory = null };
+    first_owned = false;
+    var first = (try AggregatedMetrics.aggregate(allocator, first_raw, aggregation_type, kind.isMonotonic(), ctx)).?;
+    defer first.deinit(allocator);
+    second_owned = false;
+    var second = (try AggregatedMetrics.aggregate(allocator, second_raw, aggregation_type, kind.isMonotonic(), ctx)).?;
+    defer second.deinit(allocator);
+    const first_end = switch (first) {
+        inline else => |points| points[0].timestamps.?.time_ns,
+    };
+    const second_time = switch (second) {
+        inline else => |points| blk: {
+            try std.testing.expectEqual(@as(usize, 1), points[0].exemplars.len);
+            break :blk points[0].exemplars[0].time_ns;
+        },
+    };
+    try std.testing.expect(first_end <= second_time);
 }

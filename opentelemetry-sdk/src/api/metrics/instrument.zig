@@ -279,6 +279,11 @@ fn copyNormalizedPoints(comptime From: type, comptime To: type, allocator: std.m
         };
         initialized += 1;
     }
+    // Callers hold the recording lock, so the next batch starts after this cut.
+    if (copied.len > 0) {
+        const collection_time: u64 = @intCast(clock.nanoTimestamp());
+        for (copied) |*point| point.timestamps = .{ .time_ns = collection_time };
+    }
     return copied;
 }
 
